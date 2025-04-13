@@ -17,16 +17,32 @@ fn main() {
     engine.register(
         HTTPMethod::Get,
         "/",
-        |_: &HTTPRequest| -> Result<Vec<u8>, String> {
-            Ok("HTTP/1.1 200 OK\r\n\r\n".to_string().into_bytes())
+        |_: &HTTPRequest| -> Result<HTTPResponse, String> {
+            Ok(HTTPResponse {
+                version: HTTPVersion::HTTP1_1,
+                state: "200 OK".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            })
         },
     );
 
     engine.register(
         HTTPMethod::Get,
         "/echo/{echo}",
-        |req: &HTTPRequest| -> Result<Vec<u8>, String> {
+        |req: &HTTPRequest| -> Result<HTTPResponse, String> {
+            let mut resp = HTTPResponse {
+                version: HTTPVersion::HTTP1_1,
+                state: "200 OK".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            };
             let content = req.params.get("echo").unwrap_or("");
+            resp.headers
+                .insert("Content-Type".to_string(), "text/plain".to_string());
+            resp.headers
+                .insert("Content-Length".to_string(), content.len().to_string());
+            resp.body = Some(content.to_string().into_bytes());
             if req
                 .headers
                 .get("Accept-Encoding")
@@ -34,44 +50,48 @@ fn main() {
             {
                 let mut e = GzEncoder::new(Vec::new(), Compression::default());
                 e.write_all(content.as_bytes()).unwrap();
-                let c  = e.finish().unwrap();
-                let mut resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",c.len()
-                        ).into_bytes();
-                resp.extend(c);
-                return Ok(resp);
+                let c = e.finish().unwrap();
+                resp.headers
+                    .insert("Content-Encoding".to_string(), "gzip".to_string());
+                resp.headers
+                    .insert("Content-Type".to_string(), "text/plain".to_string());
+                resp.headers
+                    .insert("Content-Length".to_string(), c.len().to_string());
+                resp.body = Some(c);
             }
-            Ok(format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                content.len(),
-                content
-            )
-            .into_bytes())
+            Ok(resp)
         },
     );
 
     engine.register(
         HTTPMethod::Get,
         "/user-agent",
-        |req: &HTTPRequest| -> Result<Vec<u8>, String> {
+        |req: &HTTPRequest| -> Result<HTTPResponse, String> {
             let agent = req
                 .headers
                 .get("User-Agent")
                 .cloned()
                 .unwrap_or("".to_string());
-            Ok(format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                agent.len(),
-                agent
-            )
-            .into_bytes())
+            let mut resp = HTTPResponse {
+                version: HTTPVersion::HTTP1_1,
+                state: "200 OK".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            };
+
+            resp.headers
+                .insert("Content-Type".to_string(), "text/plain".to_string());
+            resp.headers
+                .insert("Content-Length".to_string(), agent.len().to_string());
+            resp.body = Some(agent.into_bytes());
+            Ok(resp)
         },
     );
 
     engine.register(
         HTTPMethod::Get,
         "/files/{file}",
-        move |req: &HTTPRequest| -> Result<Vec<u8>, String> {
+        move |req: &HTTPRequest| -> Result<HTTPResponse, String> {
             let name = req.params.get("file").unwrap_or("");
             let mut dir = env::args().collect::<Vec<String>>()[2].clone();
             dir.push_str(name);
@@ -79,23 +99,41 @@ fn main() {
                 Ok(mut f) => {
                     let mut contents = String::new();
                     f.read_to_string(&mut contents).unwrap();
-                        if req
-                            .headers
-                            .get("Accept-Encoding")
-                            .is_some_and(|v| v.split(',').any(|v| v.trim() == "gzip"))
-                        {
-                            let mut e = GzEncoder::new(Vec::new(), Compression::default());
-                            e.write_all(contents.as_bytes()).unwrap();
-                            let c  = e.finish().unwrap();
-                            let mut resp = format!(
-                                        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",c.len()
-                                    ).into_bytes();
-                            resp.extend(c);
-                            return Ok(resp);
-                        }
-                    Ok(format!( "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{}",contents.len(), contents).into_bytes())
+                    let mut resp = HTTPResponse {
+                        version: HTTPVersion::HTTP1_1,
+                        state: "200 OK".to_string(),
+                        headers: HashMap::new(),
+                        body: None,
+                    };
+                    resp.headers.insert(
+                        "Content-Type".to_string(),
+                        "application/octet-stream".to_string(),
+                    );
+                    resp.headers
+                        .insert("Content-Length".to_string(), contents.len().to_string());
+                    resp.body = Some(contents.clone().into_bytes());
+                    if req
+                        .headers
+                        .get("Accept-Encoding")
+                        .is_some_and(|v| v.split(',').any(|v| v.trim() == "gzip"))
+                    {
+                        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+                        e.write_all(contents.as_bytes()).unwrap();
+                        let c = e.finish().unwrap();
+                        resp.headers
+                            .insert("Content-Encoding".to_string(), "gzip".to_string());
+                        resp.headers
+                            .insert("Content-Length".to_string(), c.len().to_string());
+                        resp.body = Some(c);
+                    }
+                    Ok(resp)
                 }
-                Err(_) => Ok("HTTP/1.1 404 Not Found\r\n\r\n".to_string().into_bytes()),
+                Err(_) => Ok(HTTPResponse {
+                    version: HTTPVersion::HTTP1_1,
+                    state: "404 Not Found".to_string(),
+                    headers: HashMap::new(),
+                    body: None,
+                }),
             }
         },
     );
@@ -103,7 +141,7 @@ fn main() {
     engine.register(
         HTTPMethod::Post,
         "/files/{file}",
-        move |req: &HTTPRequest| -> Result<Vec<u8>, String> {
+        move |req: &HTTPRequest| -> Result<HTTPResponse, String> {
             let name = req.params.get("file").unwrap_or("");
             let mut dir = env::args().collect::<Vec<String>>()[2].clone();
             dir.push_str(name);
@@ -116,9 +154,19 @@ fn main() {
             {
                 Ok(mut f) => {
                     req.body.clone().map(|s| f.write_all(s.as_bytes()));
-                    Ok("HTTP/1.1 201 Created\r\n\r\n".to_string().into_bytes())
+                    Ok(HTTPResponse {
+                        version: HTTPVersion::HTTP1_1,
+                        state: "201 Created".to_string(),
+                        headers: HashMap::new(),
+                        body: None,
+                    })
                 }
-                Err(_) => Ok("HTTP/1.1 404 Not Found\r\n\r\n".to_string().into_bytes()),
+                Err(_) => Ok(HTTPResponse {
+                    version: HTTPVersion::HTTP1_1,
+                    state: "404 Not Found".to_string(),
+                    headers: HashMap::new(),
+                    body: None,
+                }),
             }
         },
     );
@@ -126,14 +174,14 @@ fn main() {
 }
 
 trait Handler {
-    fn handle(&self, req: &HTTPRequest) -> Result<Vec<u8>, String>;
+    fn handle(&self, req: &HTTPRequest) -> Result<HTTPResponse, String>;
 }
 
 impl<F> Handler for F
 where
-    F: Fn(&HTTPRequest) -> Result<Vec<u8>, String>,
+    F: Fn(&HTTPRequest) -> Result<HTTPResponse, String>,
 {
-    fn handle(&self, req: &HTTPRequest) -> Result<Vec<u8>, String> {
+    fn handle(&self, req: &HTTPRequest) -> Result<HTTPResponse, String> {
         self(req)
     }
 }
@@ -190,9 +238,13 @@ impl Engine {
                 Some(s) => {
                     let close = req.headers.get("Connection").is_some_and(|x| x == "close");
                     req.params = s.params;
-                    let resp = s.value.handle(&req)?;
+                    let mut resp = s.value.handle(&req)?;
+                    if close {
+                        resp.headers
+                            .insert("Connection".to_string(), "close".to_string());
+                    }
                     stream
-                        .write_all(resp.as_slice())
+                        .write_all(resp.to_vec().as_slice())
                         .map_err(|err| format!("invalid wriate response {}", err))?;
                     if close {
                         return Ok(());
@@ -208,6 +260,33 @@ impl Engine {
     }
 }
 
+#[derive(Debug)]
+struct HTTPResponse {
+    version: HTTPVersion,
+    state: String,
+    headers: HashMap<String, String>,
+    body: Option<Vec<u8>>,
+}
+
+impl HTTPResponse {
+    fn to_vec(&self) -> Vec<u8> {
+        let mut buf = vec![format!("{} {}", self.version.to_string(), self.state)];
+        buf.extend(
+            self.headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>(),
+        );
+        buf.push("\r\n".to_string());
+
+        let mut buf = buf.join("\r\n").into_bytes();
+        if let Some(body) = &self.body {
+            buf.extend(body);
+        }
+        buf
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum HTTPMethod {
     Get,
@@ -220,6 +299,17 @@ enum HTTPVersion {
     HTTP1_1,
     HTTP2,
     HTTP3,
+}
+
+impl ToString for HTTPVersion {
+    fn to_string(&self) -> String {
+        match self {
+            HTTPVersion::HTTP1_0 => "HTTP/1.0".to_string(),
+            HTTPVersion::HTTP1_1 => "HTTP/1.1".to_string(),
+            HTTPVersion::HTTP2 => "HTTP/2".to_string(),
+            HTTPVersion::HTTP3 => "HTTP/3".to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
