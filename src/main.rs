@@ -7,6 +7,7 @@ use std::io::prelude::*;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{env, thread};
 
 fn main() {
@@ -114,7 +115,7 @@ fn main() {
                 .open(&dir)
             {
                 Ok(mut f) => {
-                    f.write_all(req.body.clone().unwrap().as_bytes()).unwrap();
+                    req.body.clone().map(|s| f.write_all(s.as_bytes()));
                     Ok("HTTP/1.1 201 Created\r\n\r\n".to_string().into_bytes())
                 }
                 Err(_) => Ok("HTTP/1.1 404 Not Found\r\n\r\n".to_string().into_bytes()),
@@ -166,6 +167,9 @@ impl Engine {
                     let handler = original.clone();
                     println!("accepted new connection");
                     thread::spawn(move || {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(60)))
+                            .unwrap();
                         handler.handle_request(stream).unwrap();
                     });
                 }
@@ -176,24 +180,31 @@ impl Engine {
     }
 
     fn handle_request(&self, mut stream: TcpStream) -> Result<(), String> {
-        println!("accepted new connection");
-        let mut req = HTTPRequest::parse(&stream).unwrap();
-        if let Some(s) = self
-            .handlers
-            .get(&req.method)
-            .and_then(|x| x.at(&req.path).ok())
-        {
-            req.params = s.params;
-            let resp = s.value.handle(&req)?;
-            stream
-                .write_all(resp.as_slice())
-                .map_err(|err| format!("invalid wriate response {}", err))?;
-            return Ok(());
+        loop {
+            let mut req = HTTPRequest::parse(&stream)?;
+            match self
+                .handlers
+                .get(&req.method)
+                .and_then(|x| x.at(&req.path).ok())
+            {
+                Some(s) => {
+                    let close = req.headers.get("Connection").is_some_and(|x| x == "close");
+                    req.params = s.params;
+                    let resp = s.value.handle(&req)?;
+                    stream
+                        .write_all(resp.as_slice())
+                        .map_err(|err| format!("invalid wriate response {}", err))?;
+                    if close {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    stream
+                        .write_all("HTTP/1.1 404 Not Found\r\n\r\n".to_string().as_bytes())
+                        .map_err(|err| format!("invalid wriate response {}", err))?;
+                }
+            }
         }
-        stream
-            .write_all("HTTP/1.1 404 Not Found\r\n\r\n".to_string().as_bytes())
-            .map_err(|err| format!("invalid wriate response {}", err))?;
-        Ok(())
     }
 }
 
@@ -226,11 +237,14 @@ impl HTTPRequest<'_, '_> {
         let mut req = HTTPRequest::default();
         let mut buf = [0; 2048];
         let mut reader = Vec::new();
-        stream
-            .read(&mut buf)
-            .map(|n| reader.extend_from_slice(&buf[..n]))
-            .map_err(|e| e.to_string())?;
+        while reader.is_empty() {
+            stream
+                .read(&mut buf)
+                .map(|n| reader.extend_from_slice(&buf[..n]))
+                .map_err(|e| e.to_string())?;
+        }
         let content = String::from_utf8(reader).map_err(|e| e.to_string())?;
+        dbg!(&content);
         let mut content = content.split("\r\n");
         content
             .next()
@@ -258,14 +272,14 @@ impl HTTPRequest<'_, '_> {
             })
             .ok_or("invalid parse start line")?;
 
-        while let [key, value] = content
+        while let Some(line) = content
             .next()
-            .ok_or("invalid parse headers")
             .map(|n| n.split(": ").map(|s| s.to_string()).collect::<Vec<_>>())
-            .map_err(|e| e.to_string())?
-            .as_slice()
+            .filter(|v| v.len() == 2)
         {
-            req.headers.insert(key.to_owned(), value.to_owned());
+            if let [k, v] = line.as_slice() {
+                req.headers.insert(k.clone(), v.clone());
+            }
         }
 
         let _ = content.next().map(|n| {
