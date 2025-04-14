@@ -2,16 +2,17 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use matchit::{Params, Router};
 use std::collections::HashMap;
+use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
-use std::{env, thread};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+#[tokio::main]
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:4221").await.unwrap();
     let mut engine = Engine::new();
 
     engine.register(
@@ -170,7 +171,7 @@ fn main() {
             }
         },
     );
-    engine.serve(listener).unwrap();
+    engine.serve(listener).await.unwrap();
 }
 
 trait Handler {
@@ -186,14 +187,19 @@ where
     }
 }
 struct Engine {
-    handlers: HashMap<HTTPMethod, Router<Box<dyn Handler>>>,
+    handlers: HashMap<HTTPMethod, Router<Box<dyn Handler + Sync + Send>>>,
 }
 
 unsafe impl Sync for Engine {}
 unsafe impl Send for Engine {}
 
 impl Engine {
-    fn register(&mut self, method: HTTPMethod, path: &str, handler: impl Handler + 'static) {
+    fn register(
+        &mut self,
+        method: HTTPMethod,
+        path: &str,
+        handler: impl Handler + 'static + Sync + Send,
+    ) {
         let _ = self
             .handlers
             .entry(method)
@@ -207,29 +213,21 @@ impl Engine {
         }
     }
 
-    fn serve(self, listener: TcpListener) -> Result<(), String> {
+    async fn serve(self, listener: TcpListener) -> Result<(), String> {
         let original = Arc::new(self);
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let handler = original.clone();
-                    println!("accepted new connection");
-                    thread::spawn(move || {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(60)))
-                            .unwrap();
-                        handler.handle_request(stream).unwrap();
-                    });
-                }
-                Err(e) => return Err(format!("failed to accept connection: {}", e)),
-            }
+        loop {
+            let (stream, _) = listener.accept().await.map_err(|err| err.to_string())?;
+            println!("accepted new connection");
+            let handle = original.clone();
+            tokio::spawn(async move {
+                handle.handle_request(stream).await.unwrap();
+            });
         }
-        Ok(())
     }
 
-    fn handle_request(&self, mut stream: TcpStream) -> Result<(), String> {
+    async fn handle_request(&self, mut stream: TcpStream) -> Result<(), String> {
         loop {
-            let mut req = HTTPRequest::parse(&stream)?;
+            let mut req = HTTPRequest::parse(&mut stream).await?;
             match self
                 .handlers
                 .get(&req.method)
@@ -245,6 +243,7 @@ impl Engine {
                     }
                     stream
                         .write_all(resp.to_vec().as_slice())
+                        .await
                         .map_err(|err| format!("invalid wriate response {}", err))?;
                     if close {
                         return Ok(());
@@ -253,6 +252,7 @@ impl Engine {
                 None => {
                     stream
                         .write_all("HTTP/1.1 404 Not Found\r\n\r\n".to_string().as_bytes())
+                        .await
                         .map_err(|err| format!("invalid wriate response {}", err))?;
                 }
             }
@@ -323,13 +323,14 @@ struct HTTPRequest<'k, 'v> {
 }
 
 impl HTTPRequest<'_, '_> {
-    pub fn parse(mut stream: &TcpStream) -> Result<HTTPRequest, String> {
+    pub async fn parse(stream: &mut TcpStream) -> Result<HTTPRequest, String> {
         let mut req = HTTPRequest::default();
         let mut buf = [0; 2048];
         let mut reader = Vec::new();
         while reader.is_empty() {
             stream
                 .read(&mut buf)
+                .await
                 .map(|n| reader.extend_from_slice(&buf[..n]))
                 .map_err(|e| e.to_string())?;
         }
